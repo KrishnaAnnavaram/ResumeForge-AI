@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Resume — {{full_name}}</title>
+<style>
+  @page {
+    size: A4;
+    margin: 20mm 18mm 20mm 18mm;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Georgia', 'Times New Roman', serif;
+    font-size: 10.5pt;
+    line-height: 1.45;
+    color: #1a1a1a;
+    background: #fff;
+  }
+
+  /* ── Header ── */
+  .header {
+    border-bottom: 2px solid #1a1a1a;
+    padding-bottom: 8px;
+    margin-bottom: 14px;
+  }
+  .header h1 {
+    font-size: 22pt;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: #0d0d0d;
+  }
+  .contact-line {
+    font-size: 9pt;
+    color: #444;
+    margin-top: 4px;
+  }
+  .contact-line a { color: #444; text-decoration: none; }
+
+  /* ── Section headings ── */
+  h2 {
+    font-size: 11pt;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: #1a1a1a;
+    border-bottom: 1px solid #ccc;
+    padding-bottom: 2px;
+    margin: 14px 0 6px;
+  }
+
+  /* ── Body text ── */
+  p { margin-bottom: 4px; }
+  li {
+    margin-left: 16px;
+    margin-bottom: 3px;
+    list-style-type: disc;
+  }
+
+  /* ── Skills ── */
+  .skills-list { line-height: 1.6; }
+
+  /* ── Experience entry ── */
+  .exp-header {
+    display: flex;
+    justify-content: space-between;
+    font-weight: 700;
+  }
+  .exp-company { font-style: italic; font-weight: normal; color: #444; }
+
+  /* ── ATS keyword highlights (for on-screen preview — stripped from PDF) ── */
+  mark { background: #FAEEDA; padding: 0 2px; border-radius: 2px; }
+
+  /* ── Page break control ── */
+  .no-break { page-break-inside: avoid; }
+
+  strong { font-weight: 700; }
+  br { line-height: 0.5; }
+</style>
+</head>
+<body>
+
+<header class="header">
+  <h1>{{full_name}}</h1>
+  <div class="contact-line">
+    {{email}}
+    {% if phone %} &nbsp;|&nbsp; {{phone}} {% endif %}
+    {% if linkedin_url %} &nbsp;|&nbsp; <a href="{{linkedin_url}}">{{linkedin_url}}</a> {% endif %}
+  </div>
+</header>
+
+<main>
+  {{resume_body}}
+</main>
+
+</body>
+</html>
