@@ -88,6 +88,7 @@ This README is the **one location that explains all of ResumeForge AI**. It give
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one run](#42-the-life-cycle-of-one-run)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🕸️ [The graph and the run state](#5-the-graph-and-the-run-state)
 6. 🎯 [The ATS analyzer and the ATS rescorer](#6-the-ats-analyzer-and-the-ats-rescorer)
 7. ✍️ [The resume writer](#7-the-resume-writer)
@@ -178,6 +179,46 @@ flowchart LR
 | Containers | `Dockerfile.backend`, `Dockerfile.frontend`, `docker-compose.yml` | Backend on port 8000, Vite dev server on port 5173 |
 | Build specification | `CLAUDE.md` | The full system specification and build order that produced the code |
 
+The component map shows which component calls which component.
+
+```mermaid
+flowchart LR
+    subgraph FE["frontend/src"]
+        SCR["5 screens<br/>JDInput, ATSDashboard, ResumePreview,<br/>CoverLetter, LogTable"]
+        HOOK["useGraphStatus"]
+        APIC["lib/api.ts"]
+    end
+    subgraph APP["backend/main.py"]
+        MW["Middleware<br/>logging, security, CORS"]
+        RT["api/routes.py"]
+        AU["api/auth.py"]
+        CORE["core<br/>guardrails, rate_limit, exceptions"]
+    end
+    subgraph AG["backend/agents"]
+        GR["graph.py<br/>StateGraph, 9 nodes"]
+        NODES["5 work nodes"]
+    end
+    subgraph LLM["backend/llm"]
+        CC["claude_client.py"]
+        GC["gpt_client.py"]
+        CB["core/circuit_breaker.py"]
+    end
+    REG["mcp_servers/mcp_registry.py<br/>5 tool servers"]
+    SCR --> APIC
+    HOOK --> APIC
+    APIC --> MW --> RT
+    RT --> AU
+    RT --> CORE
+    RT --> GR
+    RT --> REG
+    GR --> NODES
+    NODES --> CC
+    NODES --> GC
+    NODES --> REG
+    CC --> CB
+    GC --> CB
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -201,6 +242,26 @@ flowchart TB
 ### 2.3 The LLM split
 
 The code keeps a fixed split between the two LLM providers. `CLAUDE.md` gives the reason: GPT-4o writes more varied bullet prose, and Claude is better at structured scoring and document coherence.
+
+```mermaid
+flowchart LR
+    subgraph OPUS["Claude Opus"]
+        AJ["analyze_jd<br/>keywords, first ATS score, gap JSON"]
+        RR["rescore_resume<br/>new ATS score, section scores"]
+    end
+    subgraph GPT["GPT-4o"]
+        RB["rewrite_bullets<br/>JSON array of bullets"]
+    end
+    subgraph SON["Claude Sonnet"]
+        AR["assemble_resume<br/>Summary, Skills, full resume"]
+        GCL["generate_cover_letter<br/>3 paragraphs"]
+    end
+    AJ -- "rewrite hints" --> RB
+    RB -- "rewritten bullets" --> AR
+    AR -- "resume text" --> RR
+    IN[/"JD and profile"/] --> AJ
+    IN -- "after Gate 3" --> GCL
+```
 
 | LLM | Model setting | Tasks | Maximum output tokens |
 |---|---|---|---|
@@ -269,6 +330,19 @@ The code reads keys through `get_settings()`. `.env` is in `.gitignore`. The fro
 ### 3.8 Each table has Row Level Security
 Migration `006` enables Row Level Security on all 5 tables with the policy `user_id = auth.uid()`. The backend uses the service role key, so each tool also filters by `user_id`.
 
+```mermaid
+flowchart LR
+    JWT[/"Bearer JWT"/] --> AUTH["get_current_user_id<br/>user_id = sub claim"]
+    AUTH --> TOOL["Tool method<br/>for example get_resume_by_id"]
+    TOOL --> Q["Supabase query<br/>.eq(#quot;user_id#quot;, user_id)"]
+    Q --> SRK["Supabase client<br/>service role key"]
+    SRK --> T[("profiles, jobs, resumes,<br/>cover_letters, application_logs")]
+    RLS["Row Level Security<br/>user_id = auth.uid()"] -. "bypassed by the service role key" .- SRK
+    RLS -. "policy on each table" .- T
+```
+
+The backend query filter is the only per-user isolation that is active. Row Level Security protects the tables from a client that uses a user session.
+
 ### 3.9 Store PDF paths, not PDF files
 `docgen-mcp` uploads a PDF to Supabase Storage and returns the storage path. The database stores only a URL or a path in `pdf_url`.
 
@@ -279,26 +353,62 @@ Migration `006` enables Row Level Security on all 5 tables with the policy `user
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    START(["POST /api/graph/run"]) --> ATS["ats_analyzer<br/>Claude Opus"]
-    ATS --> P1[["pause: show_ats"]]
-    P1 -- "POST /api/graph/resume<br/>user_confirmed" --> SA["show_ats"]
-    SA -- "user_confirmed = false" --> E1(["END"])
-    SA -- "user_confirmed = true" --> RW["resume_writer<br/>GPT-4o + Claude Sonnet"]
+flowchart TD
+    JD[/"Company name, job title, JD<br/>POST /api/graph/run"/] --> ATS["ats_analyzer<br/>Claude Opus"]
+    PROF[("profiles<br/>via profile-mcp")] --> ATS
+    PROF --> RW
+    ATS -- "save_job" --> JOBS[("jobs")]
+    ATS --> G1{{"HUMAN Gate 1<br/>pause before show_ats<br/>user_confirmed"}}
+    G1 -- "false" --> E1[/"END, no resume"/]
+    G1 -- "true" --> RW["resume_writer<br/>GPT-4o + Claude Sonnet"]
+    RW -- "save_resume" --> RES[("resumes")]
     RW --> RS["ats_rescorer<br/>Claude Opus"]
-    RS -- "below 95 and retry_count below 3" --> RW
-    RS -- "95 or more, or retry_count = 3" --> P2[["pause: show_resume"]]
-    P2 -- "is_confirmed" --> SR["show_resume"]
-    SR --> P3[["pause: cover_letter_ask"]]
-    P3 -- "wants_cover_letter" --> CA["cover_letter_ask"]
-    CA -- "true" --> CL["cover_letter<br/>Claude Sonnet"]
-    CA -- "false" --> FL["feedback_log"]
-    CL --> P4[["pause: show_cover_letter"]]
-    P4 --> SC["show_cover_letter"] --> FL
-    FL --> E2(["END"])
+    RS --> D1{"ats_score 95 or more,<br/>or retry_count 3?"}
+    D1 -- "no" --> RW
+    D1 -- "yes" --> G2{{"HUMAN Gate 2<br/>pause before show_resume<br/>is_confirmed"}}
+    G2 -- "confirm_resume" --> RES
+    G2 --> G3{{"HUMAN Gate 3<br/>pause before cover_letter_ask<br/>wants_cover_letter"}}
+    G3 -- "true" --> CL["cover_letter<br/>Claude Sonnet"]
+    G3 -- "false" --> FL["feedback_log"]
+    CL -- "save_cover_letter" --> CLS[("cover_letters")]
+    CL --> P4["pause before show_cover_letter<br/>user reads the letter"]
+    P4 --> FL
+    FL -- "append_log" --> LOG[("application_logs")]
+    FL --> OUT[/"Resume version, optional cover letter,<br/>log row, run status complete"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class G1,G2,G3 human
 ```
 
 ### 4.2 The life cycle of one run
+
+The status route gives one of three status values: `running`, `interrupted` or `complete`. The diagram shows the status and the next node of one run.
+
+```mermaid
+stateDiagram-v2
+    state "running: ats_analyzer" as R1
+    state "interrupted: show_ats (Gate 1)" as I1
+    state "running: resume_writer, ats_rescorer" as R2
+    state "interrupted: show_resume (Gate 2)" as I2
+    state "interrupted: cover_letter_ask (Gate 3)" as I3
+    state "running: cover_letter" as R3
+    state "interrupted: show_cover_letter" as I4
+    state "running: feedback_log" as R4
+    state "complete" as Done
+    [*] --> R1: POST /api/graph/run, new run_id
+    R1 --> I1: job saved, first ATS score
+    I1 --> Done: user_confirmed false, route_after_ats gives END
+    I1 --> R2: user_confirmed true
+    R2 --> R2: score below 95 and retry_count below 3
+    R2 --> I2: score 95 or more, or retry_count 3
+    I2 --> I3: POST /api/graph/resume, any body
+    I3 --> R3: wants_cover_letter true
+    I3 --> R4: wants_cover_letter false
+    R3 --> I4: cover letter saved
+    I4 --> R4: POST /api/graph/resume
+    R4 --> Done: application_logs row written
+    Done --> [*]
+```
 
 1. The user types a company name and a job title, and pastes the JD on the `/` screen.
 2. The frontend sends `POST /api/graph/run`. The backend checks the JWT, the rate limits and the input limits.
@@ -313,11 +423,84 @@ flowchart TB
 11. If the user selects "Yes, generate", `cover_letter` writes the cover letter, and the graph pauses before `show_cover_letter`.
 12. `feedback_log` writes one `application_logs` row. The run is `complete`, and the frontend opens `/logs`.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant FE as React frontend
+    participant API as FastAPI routes
+    participant RD as Upstash Redis
+    participant G as LangGraph graph
+    participant MCP as MCPRegistry
+    participant CO as Claude Opus
+    participant GP as GPT-4o
+    participant CS as Claude Sonnet
+    participant PG as Supabase Postgres
+
+    U->>FE: company name, job title, JD
+    FE->>API: POST /api/graph/run with Bearer JWT
+    API->>RD: check_global_limit, check_graph_run_limit
+    API->>G: asyncio.create_task, astream with thread_id = run_id
+    API-->>FE: run_id, status running
+    G->>MCP: profile-mcp.get_profile
+    MCP->>RD: read profile cache
+    G->>CO: analyze_jd
+    G->>MCP: storage-mcp.save_job
+    MCP->>PG: insert jobs row
+    G->>PG: checkpoint, pause before show_ats
+    FE->>API: GET /api/graph/status/run_id every 2 seconds
+    API-->>FE: interrupted, show_ats, ATS score and gap JSON
+    U->>FE: Generate optimised resume (Gate 1)
+    FE->>API: POST /api/graph/resume/run_id, user_confirmed true
+    API->>G: aupdate_state, then astream
+    loop maximum 3 passes, until score 95
+        G->>GP: rewrite_bullets
+        G->>CS: assemble_resume
+        G->>MCP: storage-mcp.save_resume
+        G->>CO: rescore_resume
+    end
+    G->>PG: checkpoint, pause before show_resume
+    U->>FE: Confirm + download PDF (Gate 2)
+    FE->>API: POST /api/graph/resume/run_id, is_confirmed true
+    API->>MCP: storage-mcp.confirm_resume
+    U->>FE: Yes, generate or Skip (Gate 3)
+    FE->>API: POST /api/graph/resume/run_id, wants_cover_letter
+    opt wants_cover_letter true
+        G->>CS: generate_cover_letter
+        G->>MCP: storage-mcp.save_cover_letter
+        G->>PG: checkpoint, pause before show_cover_letter
+        U->>FE: Continue to feedback
+        FE->>API: POST /api/graph/resume/run_id, empty body
+    end
+    G->>MCP: log-mcp.append_log
+    MCP->>PG: insert application_logs row
+```
+
 ---
 
 ## 5. The graph and the run state
 
 **Purpose.** Keep each run as a resumable state machine with pauses for the user.
+
+The diagram shows how the API starts, reads and continues one graph thread.
+
+```mermaid
+flowchart TD
+    START["build_graph at startup<br/>AsyncPostgresSaver.setup()"] --> APP["graph.compile<br/>interrupt_before = 4 nodes"]
+    APP --> RUN["_run_graph<br/>astream(state, thread_id = run_id)"]
+    RUN --> NODE["Run nodes until the next<br/>interrupt node or END"]
+    NODE --> CP[("Checkpoint tables<br/>Supabase Postgres")]
+    CP --> ST["GET status: aget_state"]
+    ST --> N{"state.next"}
+    N -- "empty" --> C[/"complete"/]
+    N -- "show_ats, show_resume,<br/>cover_letter_ask, show_cover_letter" --> I[/"interrupted, interrupt_node"/]
+    N -- "other node" --> R[/"running"/]
+    I --> UPD["POST resume: aupdate_state<br/>with the gate fields"]
+    UPD --> RUN2["_run_graph<br/>astream(None, thread_id)"]
+    RUN2 --> NODE
+```
 
 | Node | Kind | LLM | Next |
 |---|---|---|---|
@@ -357,6 +540,21 @@ The interrupt nodes only write a log line and return `{}`. `graph.compile(interr
 
 **Purpose.** Give the first ATS score and the gap JSON for a JD, and give a new score for each resume version.
 
+```mermaid
+flowchart TD
+    IN[/"user_id, jd_text,<br/>company_name, job_title"/] --> GP["profile-mcp.get_profile"]
+    GP --> E1{"error key?"}
+    E1 -- "yes" --> ERR[/"error_message<br/>Profile fetch failed"/]
+    E1 -- "no" --> AJ["analyze_jd<br/>Claude Opus, 4,096 tokens"]
+    AJ --> EX["_extract_json<br/>bare JSON or code fence"]
+    EX -- "exception" --> ERR2[/"error_message<br/>ATS analysis failed"/]
+    EX --> VAL["validate_keywords_dict<br/>validate_ats_score<br/>validate_gap_json"]
+    VAL --> SJ["storage-mcp.save_job"]
+    SJ --> E2{"error key?"}
+    E2 -- "yes" --> ERR3[/"error_message<br/>Job save failed"/]
+    E2 -- "no" --> OUT[/"job_id, ats_score, jd_keywords, ats_gap<br/>user_confirmed false, retry_count 0"/]
+```
+
 | Node | Input | Output |
 |---|---|---|
 | `ats_analyzer` | `user_id`, `jd_text`, `company_name`, `job_title` | `job_id`, `ats_score`, `jd_keywords`, `ats_gap`. It sets `user_confirmed`, `retry_count` and `resume_version` to their start values |
@@ -384,6 +582,23 @@ The interrupt nodes only write a log line and return `{}`. `graph.compile(interr
 
 **Procedure of `ats_rescorer`**
 
+```mermaid
+flowchart TD
+    IN[/"resume_text, jd_text, jd_keywords,<br/>resume_id, retry_count"/] --> RR["rescore_resume<br/>Claude Opus, 1,024 tokens"]
+    RR -- "exception" --> KEEP[/"Old ats_score, retry_count + 1,<br/>error_message"/]
+    RR --> V["validate_ats_score"]
+    V --> HAS{"resume_id set?"}
+    HAS -- "yes" --> W1["storage-mcp.update_resume_pdf_url<br/>with resume_pdf_url"]
+    W1 --> W2[("resumes.ats_score_final<br/>through mcp.storage._db")]
+    W2 --> GAP["ats_gap: new section_scores,<br/>rescore_feedback"]
+    HAS -- "no" --> GAP
+    GAP --> OUT[/"ats_score, ats_gap,<br/>retry_count + 1"/]
+    OUT --> ROUTE{"route_after_rescore"}
+    KEEP --> ROUTE
+    ROUTE -- "ats_score 95 or more,<br/>or retry_count 3 or more" --> SR["show_resume"]
+    ROUTE -- "other" --> RW["resume_writer"]
+```
+
 1. Send the first 3,000 characters of the JD, the JD keywords and the resume to Claude Opus (`rescore_resume`).
 2. If the call fails, keep the old score, add 1 to `retry_count` and set `error_message`.
 3. Check the new score with `validate_ats_score`.
@@ -406,6 +621,24 @@ The two limits come from `ats_pass_threshold` and `ats_max_retries` in `Settings
 ## 7. The resume writer
 
 **Purpose.** Make one resume version for the JD from the profile, with GPT-4o bullets and a Claude Sonnet assembly.
+
+```mermaid
+flowchart TD
+    IN[/"Profile, job_title, company_name,<br/>jd_keywords, ats_gap"/] --> GP["profile-mcp.get_profile"]
+    GP --> B["Collect non-empty bullets<br/>from experience_json"]
+    B --> H["Attach the experience<br/>rewrite hint to each bullet"]
+    H --> ANY{"Any bullet?"}
+    ANY -- "no" --> AR
+    ANY -- "yes" --> RB["rewrite_bullets<br/>GPT-4o, temperature 0.7"]
+    RB --> OK{"Call and<br/>validate_bullet_list pass?"}
+    OK -- "no" --> ORIG["Use the original bullets,<br/>log a warning"]
+    OK -- "yes" --> AR["assemble_resume<br/>Claude Sonnet, 8,192 tokens"]
+    ORIG --> AR
+    AR -- "exception" --> ERR[/"error_message<br/>Resume assembly failed"/]
+    AR --> SR["storage-mcp.save_resume<br/>earlier versions is_active false"]
+    SR --> DB[("resumes<br/>new version, is_active true")]
+    SR --> OUT[/"resume_text, resume_id,<br/>resume_version + 1"/]
+```
 
 | Input | Output |
 |---|---|
@@ -450,6 +683,27 @@ Claude Sonnet must use the rewritten bullets without change. It writes the Summa
 
 **Purpose.** Write a cover letter only on request, and record each run.
 
+```mermaid
+flowchart LR
+    subgraph CLN["cover_letter"]
+        SS["profile-mcp.get_soft_skills"] --> GP["profile-mcp.get_profile"]
+        GP --> GEN["generate_cover_letter<br/>Claude Sonnet, JD first 2,000 characters"]
+        GEN --> SAVE["storage-mcp.save_cover_letter<br/>pdf_url None"]
+    end
+    subgraph FLN["feedback_log"]
+        ID{"cover_letter_id empty?"} -- "yes" --> NUL["cover_letter_id NULL"]
+        ID -- "no" --> AP["log-mcp.append_log<br/>applied, applied_on, rating, notes"]
+        NUL --> AP
+        AP --> ERR{"error key?"}
+        ERR -- "yes" --> LOGE["Log the error,<br/>return empty update"]
+    end
+    G3[/"Gate 3: wants_cover_letter"/] -- "true" --> SS
+    G3 -- "false" --> ID
+    SAVE --> CL[("cover_letters")]
+    SAVE -- "after the show_cover_letter pause" --> ID
+    AP --> LOG[("application_logs")]
+```
+
 | Node | Input | Output |
 |---|---|---|
 | `cover_letter` | Profile, soft skills, `job_title`, `company_name`, `jd_text` | `cover_letter_text`, `cover_letter_id` |
@@ -478,6 +732,22 @@ The prompt asks for 3 paragraphs: an opening, achievement examples and a close. 
 
 The tool servers are in-process Python classes with the names of MCP servers. They do not use the Model Context Protocol. `MCPRegistry` holds one object of each class and sends each `call_tool(server, tool, **kwargs)` to the correct method. An unknown server or tool gives `UNKNOWN_SERVER` or `UNKNOWN_TOOL`.
 
+```mermaid
+flowchart TD
+    CALL[/"call_tool(server, tool, kwargs)<br/>from a node or a route"/] --> S{"server in _server_map?"}
+    S -- "no" --> US[/"error, UNKNOWN_SERVER"/]
+    S -- "yes" --> T{"tool method exists?"}
+    T -- "no" --> UT[/"error, UNKNOWN_TOOL"/]
+    T -- "yes" --> M["await the tool method"]
+    M --> TRY{"Exception in the method?"}
+    TRY -- "caught by the tool" --> TE[/"error and tool code<br/>for example SAVE_JOB_ERROR"/]
+    TRY -- "not caught" --> TC[/"error, TOOL_CALL_ERROR"/]
+    TRY -- "no" --> RES[/"Result dict"/]
+    TE --> NODE{"Caller tests<br/>the error key"}
+    TC --> NODE
+    RES --> NODE
+```
+
 | Server | Class | Tools | Data |
 |---|---|---|---|
 | `profile-mcp` | `ProfileMCP` | `get_profile`, `get_resume_text`, `get_skills`, `get_soft_skills`, `get_experience`, `update_profile`, `upsert_profile` | `profiles`, Redis `profile:{user_id}` |
@@ -487,6 +757,18 @@ The tool servers are in-process Python classes with the names of MCP servers. Th
 | `log-mcp` | `LogMCP` | `append_log`, `mark_applied`, `get_all_logs`, `filter_logs`, `get_stats` | `application_logs` with joins to `jobs`, `resumes`, `cover_letters` |
 
 **Rules of `profile-mcp`**
+
+```mermaid
+flowchart LR
+    REQ[/"get_profile(user_id)"/] --> C{"Redis key<br/>profile:user_id"}
+    C -- "hit" --> OUT[/"Profile dict"/]
+    C -- "miss or Redis error" --> DB["Supabase profiles<br/>.eq user_id .single"]
+    DB -- "no row" --> NF[/"error, PROFILE_NOT_FOUND"/]
+    DB -- "row" --> SET["setex, TTL 1,800 seconds"]
+    SET --> OUT
+    UP[/"update_profile or upsert_profile"/] --> W["Write profiles row"]
+    W --> DEL["Delete the Redis key"]
+```
 
 - `get_profile` reads Redis first. On a miss, it reads Supabase and writes the cache with a TTL of 1,800 seconds.
 - `update_profile` and `upsert_profile` remove the cache key after the write.
@@ -498,6 +780,20 @@ The tool servers are in-process Python classes with the names of MCP servers. Th
 `ats-mcp` is a heuristic fallback with no LLM. `score_resume` cuts the resume into sections by header words and counts the keyword hits. The weights are summary 0.10, skills 0.25, experience 0.45, education 0.10 and certifications 0.10. No node and no route calls `ats-mcp` in the current code.
 
 **Rules of `docgen-mcp`**
+
+```mermaid
+flowchart LR
+    IN[/"resume_text, profile, template,<br/>user_id, job_id, version"/] --> TF{"templates/resume_TEMPLATE.html<br/>exists?"}
+    TF -- "no" --> DEF["Use resume.html"]
+    TF -- "yes" --> HTML
+    DEF --> HTML["_build_resume_html<br/>str.replace and _md_to_html"]
+    HTML --> W{"WeasyPrint installed?"}
+    W -- "yes" --> PDF["HTML.write_pdf"]
+    W -- "no" --> PH["Placeholder bytes"]
+    PDF --> UP["_upload_pdf<br/>bucket resumes, upsert"]
+    PH --> UP
+    UP --> OUT[/"pdf_url = storage path"/]
+```
 
 | Tool | Storage path |
 |---|---|
@@ -512,6 +808,23 @@ The renderer fills the HTML template with `str.replace`. It changes the Markdown
 ## 10. The HTTP API and authentication
 
 **Purpose.** Start, observe and continue runs, and read profiles, resumes and logs for the signed-in user.
+
+```mermaid
+flowchart LR
+    REQ[/"HTTP request"/] --> LM["RequestLoggingMiddleware<br/>correlation ID"]
+    LM --> SM["SecurityHeadersMiddleware"]
+    SM --> CORS["CORSMiddleware<br/>FRONTEND_URL only"]
+    CORS --> AU["get_current_user_id<br/>JWT check"]
+    AU --> BODY["Pydantic request model"]
+    BODY -- "not valid" --> E422[/"HTTP 422"/]
+    BODY --> RL["check_global_limit<br/>and the route limit"]
+    RL --> H["Route handler<br/>guardrails, graph, tool servers"]
+    H --> OK[/"JSON answer"/]
+    AU -- "AppError" --> EH["app_error_handler<br/>error and message only"]
+    RL -- "AppError" --> EH
+    H -- "AppError" --> EH
+    H -- "other exception" --> GE[/"HTTP 500, INTERNAL_ERROR"/]
+```
 
 | Method | Path | Rate limits | What it does |
 |---|---|---|---|
@@ -539,6 +852,23 @@ The renderer fills the HTML template with `str.replace`. It changes the Markdown
 | `applied`, `applied_on` | boolean, date string | Application status in the log row |
 
 **Procedure of authentication**
+
+```mermaid
+flowchart TD
+    H{"Authorization: Bearer header?"} -- "no" --> E1[/"401 AUTHENTICATION_REQUIRED"/]
+    H -- "yes" --> J{"JWKS in memory?"}
+    J -- "no" --> F["GET SUPABASE_URL/.well-known/jwks.json"]
+    F --> K
+    J -- "yes" --> K{"Key with the kid of the token?"}
+    K -- "no" --> FK["Use the first key"]
+    K -- "yes" --> D
+    FK --> D["jose jwt.decode<br/>RS256 or HS256, verify_aud off"]
+    D -- "expired" --> E2[/"401 EXPIRED_TOKEN"/]
+    D -- "not valid" --> E3[/"401 INVALID_TOKEN"/]
+    D --> S{"sub claim?"}
+    S -- "no" --> E3
+    S -- "yes" --> U[/"user_id on request.state"/]
+```
 
 1. Read the `Authorization: Bearer <token>` header. If it is absent, return 401 `AUTHENTICATION_REQUIRED`.
 2. Get the JWKS from `{SUPABASE_URL}/.well-known/jwks.json` and keep it in memory.
@@ -575,6 +905,8 @@ Each error body is `{"error": "<code>", "message": "<text>"}`.
 | `feedback_rating` | Integer from 1 to 5 | `VALIDATION_ERROR` |
 | Profile fields | `full_name`, `email` 200, `phone` 50, `linkedin_url` 500, `raw_resume_text` 8,000 characters | Pydantic 422 |
 
+The request model of `POST /api/graph/run` checks the same lengths before the strip. A JD outside 50 to 10,000 characters, or an empty company name or job title, gives HTTP 422 before the guardrails run.
+
 **Output guardrails** (after an LLM call)
 
 | Function | Rule |
@@ -594,6 +926,17 @@ Each error body is `{"error": "<code>", "message": "<text>"}`.
 
 If Redis is not available, the limiter accepts the request and logs a warning.
 
+```mermaid
+flowchart LR
+    IN[/"user_id, action, limit, window"/] --> K["Key rl:action:user_id"]
+    K --> P["Redis pipeline: zremrangebyscore,<br/>zcard, zadd, expire"]
+    P --> X{"Redis error?"}
+    X -- "yes" --> OPEN[/"Accept, log a warning"/]
+    X -- "no" --> CNT{"Count before this request<br/>at the limit or more?"}
+    CNT -- "yes" --> E429[/"429 RATE_LIMIT_EXCEEDED"/]
+    CNT -- "no" --> ACC[/"Accept"/]
+```
+
 **LLM retries and the circuit breaker**
 
 | Item | Value |
@@ -603,6 +946,30 @@ If Redis is not available, the limiter accepts the request and logs a warning.
 | No retry | HTTP 4xx answers other than 429 |
 | Breaker opens after | 3 failures (`circuit_breaker_failure_threshold`) |
 | Breaker tries again after | 60 seconds (`circuit_breaker_reset_timeout`) |
+
+```mermaid
+flowchart TD
+    A["Attempt 1, 2 or 3<br/>_call_claude or rewrite_bullets"] --> CB{"Circuit breaker<br/>of the provider open?"}
+    CB -- "yes, CIRCUIT_OPEN" --> W["Wait 2 ** attempt seconds<br/>+ up to 1 second jitter"]
+    CB -- "no or half open" --> CALL["LLM API call"]
+    CALL -- "4xx other than 429" --> E4[/"ClaudeError or GPTError,<br/>no retry"/]
+    CALL -- "429, 5xx or other error" --> W
+    CALL -- "success" --> TXT[/"Text or bullet list"/]
+    W --> MORE{"Attempts left?"}
+    MORE -- "yes" --> A
+    MORE -- "no" --> E5[/"ClaudeError or GPTError"/]
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> CLOSED
+    CLOSED --> CLOSED: call succeeds, failure count 0
+    CLOSED --> OPEN: 3 failures with no success between them
+    OPEN --> OPEN: call within 60 seconds raises CircuitOpenError
+    OPEN --> HALF_OPEN: first call after 60 seconds
+    HALF_OPEN --> CLOSED: call succeeds
+    HALF_OPEN --> OPEN: call fails
+```
 
 **Logs and headers**
 
@@ -616,6 +983,60 @@ If Redis is not available, the limiter accepts the request and logs a warning.
 ## 12. The database schema
 
 **Purpose.** Keep each profile, job, resume version, cover letter and log row of each user, with per-user isolation.
+
+```mermaid
+erDiagram
+    AUTH_USERS ||--o| profiles : "has"
+    AUTH_USERS ||--o{ jobs : "owns"
+    jobs ||--o{ resumes : "has versions"
+    jobs ||--o{ cover_letters : "has"
+    resumes ||--o{ cover_letters : "is base of"
+    jobs ||--o{ application_logs : "is logged in"
+    resumes ||--o{ application_logs : "is logged in"
+    cover_letters |o--o{ application_logs : "is logged in"
+    profiles {
+        uuid id PK
+        uuid user_id UK
+        text full_name
+        jsonb skills_json
+        jsonb experience_json
+        vector embedding
+    }
+    jobs {
+        uuid id PK
+        uuid user_id FK
+        text jd_raw_text
+        jsonb jd_keywords_json
+        numeric ats_score_initial
+        jsonb ats_gap_json
+    }
+    resumes {
+        uuid id PK
+        uuid job_id FK
+        integer version
+        text generated_text
+        numeric ats_score_final
+        boolean is_active
+        boolean is_confirmed
+        text pdf_url
+    }
+    cover_letters {
+        uuid id PK
+        uuid resume_id FK
+        uuid job_id FK
+        text generated_text
+        jsonb soft_skills_used
+    }
+    application_logs {
+        uuid id PK
+        uuid job_id FK
+        uuid resume_id FK
+        uuid cover_letter_id FK
+        boolean applied
+        smallint feedback_rating
+        timestamptz logged_at
+    }
+```
 
 | Migration | Contents |
 |---|---|
@@ -651,6 +1072,24 @@ Each table has `id uuid DEFAULT gen_random_uuid()` and `user_id uuid REFERENCES 
 ## 13. The frontend
 
 **Purpose.** Let the user paste a JD, see the scores, make the gate decisions and read the application log.
+
+```mermaid
+flowchart TD
+    JDI["/ JDInput<br/>api.graph.run"] --> SET["Store runId in Zustand"]
+    SET --> POLL["useGraphStatus<br/>GET status every 2 seconds"]
+    POLL --> ST{"status and interrupt_node"}
+    ST -- "running" --> POLL
+    ST -- "interrupted, show_ats" --> ATS["/ats ATSDashboard<br/>Gate 1"]
+    ST -- "interrupted, show_resume" --> RP["/resume ResumePreview<br/>Gate 2"]
+    ST -- "interrupted, cover_letter_ask<br/>or show_cover_letter" --> CLV["/cover-letter CoverLetter<br/>Gate 3"]
+    ST -- "complete" --> LOGS["/logs LogTable<br/>api.logs.list(50, 0)"]
+    ST -- "poll error" --> STOP[/"Polling stops"/]
+    ATS -- "api.graph.resume<br/>user_confirmed" --> SRV["Backend continues the run"]
+    RP -- "api.graph.resume<br/>is_confirmed" --> SRV
+    CLV -- "api.graph.resume<br/>wants_cover_letter" --> SRV
+```
+
+Only `JDInput` calls `useGraphStatus`, so polling stops after the first interrupt (Known problem 8).
 
 | Route | Screen | Contents and actions |
 |---|---|---|
@@ -711,6 +1150,15 @@ Each table has `id uuid DEFAULT gen_random_uuid()` and `user_id uuid REFERENCES 
 2. Make a private Storage bucket with the name `resumes`.
 3. Make a user in Supabase Auth. The frontend has no sign-in screen (see [Known problems](#18-known-problems)).
 4. Make the profile of the user with `POST /api/profile` and the JWT of that user.
+
+```mermaid
+flowchart LR
+    M["Run migrations<br/>001 to 006"] --> B["Make the private<br/>Storage bucket resumes"]
+    B --> U["Make a user<br/>in Supabase Auth"]
+    U --> S["Start the backend<br/>checkpointer.setup()"]
+    S --> P["POST /api/profile<br/>with the JWT of the user"]
+    P --> R["Open the frontend<br/>and start a run"]
+```
 
 Example profile body:
 
